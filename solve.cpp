@@ -66,6 +66,7 @@ private:
     std::mutex mtx;
     std::condition_variable cv;
     std::atomic<bool> found{false};
+
     StatePtr meet_point_f;
     StatePtr meet_point_b;
 
@@ -116,14 +117,6 @@ private:
         } else {
             std::cout << timestamp.str() << " " << message << std::endl;
         }
-    }
-
-/**************************************************************************************************/    
-
-public:
-    PuzzleSolver(int size) : n(size) {
-        generateGoal();
-        precomputeMoves();
     }
 
     int calculateHeuristic(const std::vector<uint8_t>& board) const {
@@ -181,8 +174,8 @@ public:
         return manhattan + linear_conflict;
     }
 
-    std::vector<std::vector<uint8_t>> getNeighbors(const std::vector<uint8_t>& board) const {
-        std::vector<std::vector<uint8_t>> neighbors;
+    std::vector<std::vector<uint8_t>> getNeighbours(const std::vector<uint8_t>& board) const {
+        std::vector<std::vector<uint8_t>> neighbours;
         
         // Find empty space
         auto it = std::find(board.begin(), board.end(), 0);
@@ -191,17 +184,16 @@ public:
         for (int next_pos : move_table[empty_pos]) {
             auto new_board = board;
             std::swap(new_board[empty_pos], new_board[next_pos]);
-            neighbors.push_back(std::move(new_board));
+            neighbours.push_back(std::move(new_board));
         }
         
-        return neighbors;
+        return neighbours;
     }
 
     void searchDirection(OpenSet& open_set, ClosedSet& visited_this, ClosedSet& visited_other, StatePtr& meet_point, bool forward) {
         const std::string direction = forward ? "FORWARD" : "BACKWARD";
         log("[" + direction + "] Search thread started");
         
-
         while (!open_set.empty() && !found.load(std::memory_order_relaxed)) {
             StatePtr current;
 
@@ -215,19 +207,20 @@ public:
                 
                 current = open_set.top();
                 open_set.pop();
+                states_visited++;
                 
-                // Skip if we've already processed this state with a better path
+                // this is quick with good hash function and siginificantly reduces branching factor
                 auto existing = visited_this.find(current->board);
                 if (existing != visited_this.end() && existing->second->g < current->g) {
                     continue;
                 }
             }
 
-            auto neighbors = getNeighbors(current->board);
-            for (auto& neighbor_board : neighbors) {
+            auto neighbours = getNeighbours(current->board);
+            for (auto& neighbor_board : neighbours) {
                 std::unique_lock<std::mutex> lock(mtx);
                 
-                // Skip if we've already visited this state with a better path
+                // again, reduce branching factor
                 auto existing = visited_this.find(neighbor_board);
                 if (existing != visited_this.end() && existing->second->g <= current->g + 1) {
                     continue;
@@ -236,12 +229,12 @@ public:
                 int g_new = current->g + 1;
                 int h_new = calculateHeuristic(neighbor_board);
                 auto neighbor = std::make_shared<PuzzleState>(neighbor_board, g_new, h_new, current);
-                
-                // Update or add to visited set
+                states_created++;
+
                 visited_this[neighbor_board] = neighbor;
                 open_set.push(neighbor);
                 
-                // Check if we've found a meeting point
+                // meeting point with the opposite search direction
                 auto match = visited_other.find(neighbor_board);
                 if (match != visited_other.end()) {
                     meet_point = neighbor;
@@ -257,11 +250,58 @@ public:
         }
     }
 
+    std::vector<std::vector<uint8_t>> reconstructPath(const ClosedSet& visited_f, const ClosedSet& visited_b) {
+        std::vector<std::vector<uint8_t>> path;
+        
+        if (meet_point_f && visited_b.find(meet_point_f->board) != visited_b.end()) {
+            // forward path
+            std::vector<std::vector<uint8_t>> forward_path;
+            for (auto p = meet_point_f; p; p = p->parent) {
+                forward_path.push_back(p->board);
+            }
+            std::reverse(forward_path.begin(), forward_path.end());
+            path = forward_path;
+            
+            // backward path
+            auto match = visited_b.at(meet_point_f->board);
+            for (auto p = match->parent; p; p = p->parent) {
+                path.push_back(p->board);
+            }
+        }
+        else if (meet_point_b && visited_f.find(meet_point_b->board) != visited_f.end()) {
+            // forward path
+            std::vector<std::vector<uint8_t>> forward_path;
+            auto match = visited_f.at(meet_point_b->board);
+            for (auto p = match; p; p = p->parent) {
+                forward_path.push_back(p->board);
+            }
+            std::reverse(forward_path.begin(), forward_path.end());
+            path = forward_path;
+            
+            // backward path
+            for (auto p = meet_point_b->parent; p; p = p->parent) {
+                path.push_back(p->board);
+            }
+        }
+        
+        return path;
+    }
+
+/**************************************************************************************************/    
+
+public:
+    PuzzleSolver(int size) : n(size) {
+        generateGoal();
+        precomputeMoves();
+    }
+
+    std::atomic<int> states_created{0};
+    std::atomic<int> states_visited{0};
+
     std::vector<std::vector<uint8_t>> solve(const std::vector<uint8_t>& start) {
         
         std::vector<uint8_t> start_board(start.begin(), start.end());
         
-        // Reset state
         found.store(false, std::memory_order_relaxed);
         meet_point_f = nullptr;
         meet_point_b = nullptr;
@@ -289,7 +329,7 @@ public:
                       std::ref(meet_point_b),
                       false);
         
-        // Wait for solution to be found
+        // Wait for solution
         {
             std::unique_lock<std::mutex> lock(mtx);
             cv.wait(lock, [&] { return found.load(std::memory_order_relaxed) || 
@@ -299,45 +339,7 @@ public:
         t1.join();
         t2.join();
         
-        // Reconstruct path
         return reconstructPath(visited_f, visited_b);
-    }
-
-    std::vector<std::vector<uint8_t>> reconstructPath(const ClosedSet& visited_f, const ClosedSet& visited_b) {
-        std::vector<std::vector<uint8_t>> path;
-        
-        if (meet_point_f && visited_b.find(meet_point_f->board) != visited_b.end()) {
-            // Collect forward path
-            std::vector<std::vector<uint8_t>> forward_path;
-            for (auto p = meet_point_f; p; p = p->parent) {
-                forward_path.push_back(p->board);
-            }
-            std::reverse(forward_path.begin(), forward_path.end());
-            path = forward_path;
-            
-            // Collect backward path
-            auto match = visited_b.at(meet_point_f->board);
-            for (auto p = match->parent; p; p = p->parent) {
-                path.push_back(p->board);
-            }
-        }
-        else if (meet_point_b && visited_f.find(meet_point_b->board) != visited_f.end()) {
-            // Collect forward path
-            std::vector<std::vector<uint8_t>> forward_path;
-            auto match = visited_f.at(meet_point_b->board);
-            for (auto p = match; p; p = p->parent) {
-                forward_path.push_back(p->board);
-            }
-            std::reverse(forward_path.begin(), forward_path.end());
-            path = forward_path;
-            
-            // Collect backward path
-            for (auto p = meet_point_b->parent; p; p = p->parent) {
-                path.push_back(p->board);
-            }
-        }
-        
-        return path;
     }
 
     void printBoard(const std::vector<uint8_t>& board) const {
@@ -351,9 +353,12 @@ public:
 
 int main() {
 
-    std::vector<uint8_t> puzzle = {
-        7, 1, 3, 6, 2, 4, 0, 5, 8
-    };
+    std::vector<uint8_t> puzzle;
+
+    int val;
+    while (std::cin >> val) {
+        puzzle.push_back(static_cast<uint8_t>(val));
+    }
 
     int n = static_cast<int>(sqrt(puzzle.size()));
     PuzzleSolver solver(n);
@@ -367,10 +372,16 @@ int main() {
     
     std::cout << "Steps to solve: " << path.size() - 1 << std::endl;
 
-    for (const auto& board : path) {
-        solver.printBoard(board);
-        std::cout << "-----------------\n";
-    }
+    std::cout << "States created: " << solver.states_created.load() << std::endl;
+    std::cout << "States visited: " << solver.states_visited.load() << std::endl;
+    std::cout << "Visited/Created ratio: " 
+          << static_cast<double>(solver.states_visited.load()) / solver.states_created.load()
+          << std::endl;
+
+    // for (const auto& board : path) {
+    //     solver.printBoard(board);
+    //     std::cout << "-----------------\n";
+    // }
     
     return 0;
 }

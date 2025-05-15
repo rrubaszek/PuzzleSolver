@@ -1,4 +1,5 @@
 import random
+import sys
 
 def count_inversions(tiles: list[int]) -> int:
     inv = 0
@@ -29,5 +30,6 @@ def generate_board(n: int) -> list[int]:
             return tiles
         
 if __name__ == "__main__":
-    n = int(input())
-    print(generate_board(n))
+    n = int(sys.argv[1])
+    board = generate_board(n)
+    print(" ".join(map(str, board)))
